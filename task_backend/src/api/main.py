@@ -1,6 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set
 from uuid import UUID
 
@@ -58,25 +59,95 @@ openapi_tags = [
 # Optional:
 # - JWT_ALG (default: HS256)
 # - JWT_EXPIRES_MINUTES (default: 60)
-# - CORS_ORIGINS: comma-separated allowed origins (default allows localhost:3000 + '*' fallback)
-# - ACCESS_TOKEN_COOKIE_NAME (default: access_token) (frontend can also send Authorization header)
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    # Safe default for preview based on task_db/db_connection.txt. Prefer setting explicitly.
-    "postgresql://appuser:dbuser123@localhost:5001/myapp",
-)
+# - CORS_ORIGINS: comma-separated allowed origins
+# - FRONTEND_URL: single origin to allow (useful in preview)
+# - ACCESS_TOKEN_COOKIE_NAME (default: access_token)
+#
+# Preview note:
+# - task_db writes `task_db/db_connection.txt` containing a psql command; we parse it to get a DSN
+#   if DATABASE_URL is not explicitly set.
+
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALG = os.getenv("JWT_ALG", "HS256")
 JWT_EXPIRES_MINUTES = int(os.getenv("JWT_EXPIRES_MINUTES", "60"))
 ACCESS_TOKEN_COOKIE_NAME = os.getenv("ACCESS_TOKEN_COOKIE_NAME", "access_token")
 
+
+def _try_read_database_url_from_connection_file() -> Optional[str]:
+    """
+    Attempt to read a PostgreSQL DSN from task_db/db_connection.txt.
+
+    The file content is written by task_db/startup.sh and looks like:
+      psql postgresql://user:pass@localhost:5001/dbname
+
+    Returns:
+        DSN (postgresql://...) if found, else None.
+    """
+    # workspace layout: backend container sibling to db container, but not guaranteed.
+    # We try a few reasonable relative locations.
+    candidates = [
+        # typical monorepo sibling
+        Path(__file__).resolve().parents[4]
+        / "clean-dashboard-with-navigation-and-task-management-223775-223791"
+        / "task_db"
+        / "db_connection.txt",
+        # in case containers are co-located under one parent
+        Path(__file__).resolve().parents[4] / "task_db" / "db_connection.txt",
+        # last resort: current working dir relative
+        Path.cwd() / "task_db" / "db_connection.txt",
+    ]
+
+    for p in candidates:
+        try:
+            if not p.exists():
+                continue
+            raw = p.read_text(encoding="utf-8").strip()
+            if not raw:
+                continue
+            # expected: "psql <dsn>"
+            parts = raw.split()
+            if len(parts) >= 2 and parts[0].lower() == "psql" and parts[1].startswith("postgresql"):
+                return parts[1]
+            # allow raw DSN too
+            if raw.startswith("postgresql://") or raw.startswith("postgres://"):
+                return raw
+        except Exception:
+            continue
+    return None
+
+
+def _get_database_url() -> str:
+    """
+    Compute DATABASE_URL from env, else from task_db connection file, else a safe preview default.
+    """
+    env_url = os.getenv("DATABASE_URL")
+    if env_url and env_url.strip():
+        return env_url.strip()
+
+    file_url = _try_read_database_url_from_connection_file()
+    if file_url:
+        return file_url
+
+    # Safe default for preview based on task_db/db_connection.txt. Prefer setting explicitly.
+    return "postgresql://appuser:dbuser123@localhost:5001/myapp"
+
+
+DATABASE_URL = _get_database_url()
+
 # CORS: Keep credentials allowed for cookie-based auth from Next.js.
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
+frontend_url = os.getenv("FRONTEND_URL", "").strip()
+
 if cors_origins_env.strip():
     ALLOW_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+elif frontend_url:
+    # Best preview default: a single concrete origin.
+    ALLOW_ORIGINS = [frontend_url]
 else:
-    # Default: allow local dev frontend, plus permissive fallback to avoid blocking preview.
-    ALLOW_ORIGINS = ["http://localhost:3000", "https://localhost:3000", "*"]
+    # Default: allow local dev frontend(s).
+    #
+    # IMPORTANT: Do NOT include "*" when allow_credentials=True; browsers will reject it.
+    ALLOW_ORIGINS = ["http://localhost:3000", "https://localhost:3000"]
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -291,6 +362,7 @@ async def lifespan(_: FastAPI):
     except Exception as e:
         # Keep running; health endpoint will report DB issue.
         print(f"[WARN] DB healthcheck failed at startup: {e}")
+        print(f"[WARN] DATABASE_URL resolved as: {DATABASE_URL}")
     yield
 
 
@@ -827,7 +899,6 @@ async def ws_tasks(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
 
-    payload = None
     try:
         payload = _verify_access_token(token)
         user_id = UUID(payload["sub"])
